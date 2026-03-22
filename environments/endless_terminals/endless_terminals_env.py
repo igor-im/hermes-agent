@@ -131,6 +131,19 @@ def _patch_managed_server():
 
 _patch_managed_server()
 
+# Silence vLLM's hermes_tool_parser ERROR logs by patching extract_tool_calls
+# to suppress its logger. vLLM configures its own logging on import so
+# setLevel/filters applied before import get reset.
+def _silence_hermes_tool_parser():
+    try:
+        from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
+        import logging as _logging
+        _logging.getLogger("vllm.tool_parsers.hermes_tool_parser").setLevel(_logging.CRITICAL)
+    except Exception:
+        pass
+
+_silence_hermes_tool_parser()
+
 from environments.hermes_base_env import HermesAgentBaseEnv, HermesAgentEnvConfig
 from environments.agent_loop import AgentResult
 from environments.tool_context import ToolContext
