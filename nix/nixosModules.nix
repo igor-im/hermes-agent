@@ -61,6 +61,56 @@
       then "${pkgs.docker}/bin/docker"
       else "${pkgs.podman}/bin/podman";
 
+    # Runs as root inside the container on every start. Provisions the
+    # hermes user + sudo on first boot (writable layer persists), then
+    # drops privileges. Supports arbitrary base images (Debian, Alpine, etc).
+    containerEntrypoint = pkgs.writeShellScript "hermes-container-entrypoint" ''
+      set -eu
+
+      HERMES_UID="''${HERMES_UID:?HERMES_UID must be set}"
+      HERMES_GID="''${HERMES_GID:?HERMES_GID must be set}"
+      HERMES_USER="hermes"
+
+      if ! getent group "$HERMES_USER" >/dev/null 2>&1; then
+        if command -v groupadd >/dev/null 2>&1; then
+          groupadd -g "$HERMES_GID" "$HERMES_USER"
+        elif command -v addgroup >/dev/null 2>&1; then
+          addgroup -g "$HERMES_GID" "$HERMES_USER" 2>/dev/null || true
+        fi
+      fi
+
+      if ! getent passwd "$HERMES_USER" >/dev/null 2>&1; then
+        if command -v useradd >/dev/null 2>&1; then
+          useradd -u "$HERMES_UID" -g "$HERMES_GID" -m -d /home/hermes -s /bin/bash "$HERMES_USER"
+        elif command -v adduser >/dev/null 2>&1; then
+          adduser -u "$HERMES_UID" -D -h /home/hermes -s /bin/sh -G "$HERMES_USER" "$HERMES_USER" 2>/dev/null || true
+        fi
+      fi
+      if [ ! -d /home/hermes ]; then
+        mkdir -p /home/hermes
+        chown "$HERMES_UID:$HERMES_GID" /home/hermes
+      fi
+
+      # Install sudo on Debian/Ubuntu if missing (first boot only, cached in writable layer)
+      if command -v apt-get >/dev/null 2>&1 && ! command -v sudo >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq sudo >/dev/null 2>&1 || true
+      fi
+      if command -v sudo >/dev/null 2>&1 && [ ! -f /etc/sudoers.d/hermes ]; then
+        mkdir -p /etc/sudoers.d
+        echo "$HERMES_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/hermes
+        chmod 0440 /etc/sudoers.d/hermes
+      fi
+
+      if command -v setpriv >/dev/null 2>&1; then
+        exec setpriv --reuid="$HERMES_UID" --regid="$HERMES_GID" --init-groups "$@"
+      elif command -v su >/dev/null 2>&1; then
+        exec su -s /bin/sh "$HERMES_USER" -c 'exec "$@"' -- "$@"
+      else
+        echo "WARNING: no privilege-drop tool (setpriv/su), running as root" >&2
+        exec "$@"
+      fi
+    '';
+
     # Identity hash — only recreate container when structural config changes.
     # Environment variables are handled via $HERMES_HOME/.env (read by
     # load_hermes_dotenv at Python startup), so they don't need container recreation.
@@ -68,6 +118,7 @@
       image = cfg.container.image;
       extraVolumes = cfg.container.extraVolumes;
       extraOptions = cfg.container.extraOptions;
+      entrypoint = builtins.toString containerEntrypoint;
     });
 
     identityFile = "${cfg.stateDir}/.container-identity";
@@ -198,14 +249,80 @@
       mcpServers = mkOption {
         type = types.attrsOf (types.submodule {
           options = {
-            command = mkOption { type = types.str; description = "MCP server command."; };
-            args = mkOption { type = types.listOf types.str; default = [ ]; };
-            env = mkOption { type = types.attrsOf types.str; default = { }; };
-            timeout = mkOption { type = types.nullOr types.int; default = null; };
+            # Stdio transport
+            command = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              description = "MCP server command (stdio transport).";
+            };
+            args = mkOption {
+              type = types.listOf types.str;
+              default = [ ];
+              description = "Command-line arguments (stdio transport).";
+            };
+            env = mkOption {
+              type = types.attrsOf types.str;
+              default = { };
+              description = "Environment variables for the server process (stdio transport).";
+            };
+
+            # HTTP/StreamableHTTP transport
+            url = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              description = "MCP server endpoint URL (HTTP/StreamableHTTP transport).";
+            };
+            headers = mkOption {
+              type = types.attrsOf types.str;
+              default = { };
+              description = "HTTP headers, e.g. for authentication (HTTP transport).";
+            };
+
+            # Common options
+            timeout = mkOption {
+              type = types.nullOr types.int;
+              default = null;
+              description = "Tool call timeout in seconds (default: 120).";
+            };
+            connect_timeout = mkOption {
+              type = types.nullOr types.int;
+              default = null;
+              description = "Initial connection timeout in seconds (default: 60).";
+            };
+
+            # Sampling (server-initiated LLM requests)
+            sampling = mkOption {
+              type = types.nullOr (types.submodule {
+                options = {
+                  enabled = mkOption { type = types.bool; default = true; description = "Enable sampling."; };
+                  model = mkOption { type = types.str; default = ""; description = "Override model for sampling requests."; };
+                  max_tokens_cap = mkOption { type = types.nullOr types.int; default = null; description = "Max tokens per request."; };
+                  timeout = mkOption { type = types.nullOr types.int; default = null; description = "LLM call timeout in seconds."; };
+                  max_rpm = mkOption { type = types.nullOr types.int; default = null; description = "Max requests per minute."; };
+                };
+              });
+              default = null;
+              description = "Sampling configuration for server-initiated LLM requests.";
+            };
           };
         });
         default = { };
-        description = "MCP server configurations (merged into settings.mcp_servers).";
+        description = ''
+          MCP server configurations (merged into settings.mcp_servers).
+          Each server uses either stdio (command/args) or HTTP (url) transport.
+        '';
+        example = literalExpression ''
+          {
+            filesystem = {
+              command = "npx";
+              args = [ "-y" "@modelcontextprotocol/server-filesystem" "/home/user" ];
+            };
+            remote-api = {
+              url = "http://my-server:8080/v0/mcp";
+              headers = { Authorization = "Bearer ..."; };
+            };
+          }
+        '';
       };
 
       # ── Service behavior ─────────────────────────────────────────────────
@@ -442,18 +559,20 @@ HERMES_NIX_ENV_EOF
             fi
 
             if [ "$NEED_CREATE" = "true" ]; then
-              # Resolve numeric UID/GID for container --user flag
+              # Resolve numeric UID/GID — passed to entrypoint for in-container user setup
               HERMES_UID=$(${pkgs.coreutils}/bin/id -u ${cfg.user})
               HERMES_GID=$(${pkgs.coreutils}/bin/id -g ${cfg.user})
 
               echo "Creating container..."
               ${containerBin} create \
                 --name ${containerName} \
-                --user "$HERMES_UID:$HERMES_GID" \
                 --network=host \
+                --entrypoint ${containerEntrypoint} \
                 --volume /nix/store:/nix/store:ro \
                 --volume ${cfg.stateDir}:/data \
                 ${lib.concatStringsSep " " (map (v: "--volume ${v}") cfg.container.extraVolumes)} \
+                --env HERMES_UID="$HERMES_UID" \
+                --env HERMES_GID="$HERMES_GID" \
                 --env HERMES_HOME=/data/.hermes \
                 --env HERMES_MANAGED=true \
                 --env HOME=/home/hermes \
